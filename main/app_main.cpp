@@ -37,7 +37,6 @@
 
 #include "esp_log.h"
 #include "homeapp.h"
-#include "temperature/temperatures.h"
 #include "flashmem.h"
 #include "ota/ota.h"
 #include "device/device.h"
@@ -47,9 +46,7 @@
 #include "factoryreset.h"
 
 
-#define TEMP_BUS 20
-#define STATEINPUT_GPIO 7
-#define STATEINPUT_GPIO2 6
+#define MSG_WAITING_GPIO   ((gpio_num_t) 6)
 #define STATISTICS_INTERVAL 1800
 #define ESP_INTR_FLAG_DEFAULT 0
 
@@ -106,30 +103,25 @@ static LoraHandler lorahandler;
 
 nvs_handle setup_flash;
 
-
-
-static void sendSetup(esp_mqtt_client_handle_t client, uint8_t *chipid);
 static void sendInfo(esp_mqtt_client_handle_t client, uint8_t *chipid);
 
 static void display_text(const char *str)
 {
     static int line = 0;
 
+    vTaskDelay(pdMS_TO_TICKS(100));
     if (str == NULL)
     {
-        vTaskDelay(pdMS_TO_TICKS(80));
         oled_clear();
-        vTaskDelay(pdMS_TO_TICKS(120));
+        vTaskDelay(pdMS_TO_TICKS(140));
         line = 0;
         return;
     }
-    if (!line) 
+    if (!line)
     {
-        vTaskDelay(pdMS_TO_TICKS(80));
         oled_clear();
-        vTaskDelay(pdMS_TO_TICKS(120));
-    }    
-    else vTaskDelay(pdMS_TO_TICKS(80));
+        vTaskDelay(pdMS_TO_TICKS(140));
+    }
     oled_draw_text(0, line++, str);
     if (line == 8) line = 0;
 }
@@ -159,23 +151,10 @@ static void log_error_if_nonzero(const char *message, int error_code)
     }
 }
 
-static void sensorFriendlyName(cJSON *root)
-{
-    char *sensorname;
-    char *friendlyname;
-
-    sensorname   = getJsonStr(root, "sensor");
-    friendlyname = getJsonStr(root, "name");
-    if (temperature_set_friendlyname(sensorname, friendlyname))
-    {
-        ESP_LOGD(TAG, "writing sensor %s, friendlyname %s to flash",sensorname, friendlyname);
-        flash_write_str(setup_flash, sensorname,friendlyname);
-        flash_commitchanges(setup_flash);
-    }
-}
+// dp = '{"origin":"6ab8","dev":"aaaa","data":"----> testi <-----"}';
 
 
-static bool handleJson(esp_mqtt_event_handle_t event)
+static bool handleJson(esp_mqtt_event_handle_t event, uint8_t *chipid)
 {
     cJSON *root = cJSON_Parse(event->data);
     bool ret = false;
@@ -193,22 +172,27 @@ static bool handleJson(esp_mqtt_event_handle_t event)
             ota_start(fname);
         }
     }
-    else if (!strcmp(id,"sensorfriendlyname"))
-    {
-        sensorFriendlyName(root);
-        ret = true;
-    }
     else if (!strcmp(id,"send"))
     {
-        struct sendmsg msg;
-        char *dp = getJsonStr(root,"msg");
-        if (strlen(dp) > 0)
+        struct tolora msg;
+
+        display_text("sending");
+        memcpy(msg.origin, &chipid[3], 3);
+        cJSON *p = cJSON_GetObjectItem(root, "msg");
+        if (p != NULL)
         {
-            display_text("sending");
-            display_text(dp);
-            strcpy(msg.data, dp);
-            lorahandler.send(&msg);
-        }    
+            char *devstr = getJsonStr(p,"dev");
+            int devnum = (int) strtol(devstr,NULL,16);
+            memcpy(&msg.dev, &devnum,3);
+            strcpy(msg.data, getJsonStr(p,"data"));
+            display_text(msg.data);
+        }
+        else
+        {
+            ESP_LOGI(TAG,"field 'msg' not found from json");
+        }
+        gpio_set_level(MSG_WAITING_GPIO, true);
+        lorahandler.send(&msg);
     }
 
     cJSON_Delete(root);
@@ -241,11 +225,11 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         ESP_LOGI(TAG,"subscribing topic %s", readTopic);
         msg_id = esp_mqtt_client_subscribe(client, readTopic, 0);
         ESP_LOGI(TAG, "sent subscribe successful, msg_id=%d", msg_id);
+        gpio_set_level(MSG_WAITING_GPIO, false);
 
         isConnected = true;
         device_sendstatus(client, comminfo->mqtt_prefix, appname, (uint8_t *) handler_args);
         sendInfo(client, (uint8_t *) handler_args);
-        sendSetup(client, (uint8_t *) handler_args);
         statistics_getptr()->connectcnt++;
         healthyflags |= HEALTHYFLAGS_MQTT;
         break;
@@ -270,7 +254,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 
     case MQTT_EVENT_DATA:
         display_text("received a MQTT message");
-        if (handleJson(event)) sendSetup(client, (uint8_t *) handler_args);
+        handleJson(event,(uint8_t *) handler_args );
         break;
 
     case MQTT_EVENT_ERROR:
@@ -326,9 +310,9 @@ static void sendInfo(esp_mqtt_client_handle_t client, uint8_t *chipid)
 {
     char infoTopic[42];
 
-    sprintf(infoTopic,"%s/%s/%x%x%x/info",
+    sprintf(infoTopic,"%s/%s/%02x%02x%02x/info",
          comminfo->mqtt_prefix, appname, chipid[3],chipid[4],chipid[5]);
-    sprintf(jsondata, "{\"dev\":\"%x%x%x\",\"id\":\"info\",\"memfree\":%d,\"idfversion\":\"%s\",\"progversion\":\"%s\"}",
+    sprintf(jsondata, "{\"dev\":\"%02x%02x%02x\",\"id\":\"info\",\"memfree\":%d,\"idfversion\":\"%s\",\"progversion\":\"%s\"}",
                 chipid[3],chipid[4],chipid[5],
                 esp_get_free_heap_size(),
                 esp_get_idf_version(),
@@ -337,51 +321,24 @@ static void sendInfo(esp_mqtt_client_handle_t client, uint8_t *chipid)
     statistics_getptr()->sendcnt++;
 }
 
-static void loradata_send(struct measurement *meas, esp_mqtt_client_handle_t client, uint8_t *chipid)
+static void sendtowifi(struct measurement *meas, esp_mqtt_client_handle_t client, uint8_t *chipid)
 {
     char loraTopic[42];
     time_t now;
 
     time(&now);
 
-    sprintf(loraTopic,"%s/%s/%x%x%x/loradata",
+    sprintf(loraTopic,"%s/%s/%02x%02x%02x/loradata",
          comminfo->mqtt_prefix, appname, chipid[3],chipid[4],chipid[5]);
-    sprintf(jsondata, "{\"dev\":\"%x%x%x\",\"ts\":%jd,\"id\":\"loradata\",\"data\":%s}",
+    sprintf(jsondata, "{\"bridge\":\"%02x%02x%02x\",\"ts\":%jd,\"id\":\"loradata\",\"rssi\":%.1f,\"snr\":%.1f,\"data\":%s}",
                 chipid[3],chipid[4],chipid[5],now,
-                meas->data.loradata);
+                meas->data.rssi,
+                meas->data.snr,
+                meas->data.recdata);
     esp_mqtt_client_publish(client, loraTopic, jsondata , 0, 0, 1);
     statistics_getptr()->sendcnt++;
 }
 
-
-static void sendSetup(esp_mqtt_client_handle_t client, uint8_t *chipid)
-{
-    char setupTopic[42];
-    sprintf(setupTopic,"%s/%s/%x%x%x/setup",
-         comminfo->mqtt_prefix, appname, chipid[3],chipid[4],chipid[5]);
-
-    sprintf(setupTopic,"%s/%s/%x%x%x/tempsensors",
-        comminfo->mqtt_prefix, appname, chipid[3],chipid[4],chipid[5]);
-    sprintf(jsondata, "{\"dev\":\"%x%x%x\",\"id\":\"tempsensors\",\"names\":[",
-        chipid[3],chipid[4],chipid[5]);
-
-    int sensorCnt=0;
-    char sensorname[40];
-    for (int i = 0; ; i++)
-    {
-        char *sensoraddr = temperature_getsensor(i);
-
-        if (sensoraddr == NULL) break;
-        sprintf(sensorname,"{\"addr\":\"%s\",\"name\":\"%s\"},",
-            sensoraddr, temperature_get_friendlyname(i));
-        strcat(jsondata,sensorname);
-        sensorCnt++;
-    }
-    if (sensorCnt) jsondata[strlen(jsondata)-1] = 0; // cut last comma
-    strcat(jsondata,"]}");
-    esp_mqtt_client_publish(client, setupTopic, jsondata , 0, 0, 1);
-    statistics_getptr()->sendcnt++;
-}
 
 static esp_mqtt_client_handle_t mqtt_app_start(uint8_t *chipid)
 {
@@ -389,7 +346,7 @@ static esp_mqtt_client_handle_t mqtt_app_start(uint8_t *chipid)
     char uri[64];
     char deviceTopic[42];
     
-    sprintf(client_id,"client_id=%s%x%x%x",
+    sprintf(client_id,"client_id=%s%02x%02x%02x",
         comminfo->mqtt_prefix ,chipid[3],chipid[4],chipid[5]);
     sprintf(uri,"mqtt://%s:%s",comminfo->mqtt_server, comminfo->mqtt_port);
 
@@ -537,6 +494,10 @@ extern "C" void app_main(void)
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
+    gpio_reset_pin(MSG_WAITING_GPIO);
+    gpio_set_direction(MSG_WAITING_GPIO, GPIO_MODE_OUTPUT);
+    gpio_set_level(MSG_WAITING_GPIO, true);
+
     ESP_ERROR_CHECK(oled_init());
     display_text("Heltec ESP32-S3");
     display_text("Initializing...");
@@ -562,28 +523,6 @@ extern "C" void app_main(void)
         wifi_connect(comminfo->ssid, comminfo->password);
         esp_wifi_set_ps(WIFI_PS_NONE);
         evt_queue = xQueueCreate(10, sizeof(struct measurement));
-        int sensorcnt = temperature_init(TEMP_BUS, appname, chipid, 8);
-        if (sensorcnt)
-        {
-            char *sensoraddr;
-            char *friendlyname;
-
-            for (int i = 0; i < sensorcnt; i++)
-            {
-                sensoraddr   = temperature_getsensor(i);
-                if (sensoraddr == NULL) break;
-                friendlyname = flash_read_str(setup_flash, sensoraddr, sensoraddr, 20);
-                if (strcmp(friendlyname, sensoraddr))
-                {
-                    if (!temperature_set_friendlyname(sensoraddr, friendlyname))
-                    {
-                        ESP_LOGD(TAG, "Set friendlyname for %s failed", sensoraddr);
-                    }
-                    free(friendlyname); // flash_read_str does dynamic allocation
-                }
-            }
-        }
-
         esp_mqtt_client_handle_t client = mqtt_app_start(chipid);
         sntp_start();
 
@@ -592,14 +531,14 @@ extern "C" void app_main(void)
 
         ESP_LOGI(TAG, "[APP] All init done, app_main, last line.");
 
-        sprintf(statisticsTopic,"%s/%s/%x%x%x/statistics",
+        sprintf(statisticsTopic,"%s/%s/%02x%02x%02x/statistics",
             comminfo->mqtt_prefix, appname, chipid[3],chipid[4],chipid[5]);
         ESP_LOGI(TAG,"statisticsTopic=[%s]", statisticsTopic);
 
-        sprintf(otaUpdateTopic,"%s/%s/%x%x%x/otaupdate",
+        sprintf(otaUpdateTopic,"%s/%s/%02x%02x%02x/otaupdate",
             comminfo->mqtt_prefix, appname, chipid[3],chipid[4],chipid[5]);
 
-        sprintf(readTopic,"%s/%s/%x%x%x/send",
+        sprintf(readTopic,"%s/%s/%02x%02x%02x/send",
             comminfo->mqtt_prefix, appname, chipid[3],chipid[4],chipid[5]);
 
         prevStatsTs = 0;
@@ -646,20 +585,13 @@ extern "C" void app_main(void)
                 }
 
                 switch (meas.id) {
-                    case TEMPERATURE:
-                        display_text("Got temperature");
-                        healthyflags |= HEALTHYFLAGS_TEMP;
-                        if (isConnected) temperature_send(comminfo->mqtt_prefix, &meas, client);
-                    break;
-
                     case OTA:
                         ota_status_publish(&meas, client);
                     break;
 
                     case LORA:
-                        display_text("Got loradata");
-                        display_text(meas.data.loradata);
-                        if (isConnected) loradata_send(&meas, client, chipid);
+                        display_text("Got fromlora");
+                        if (isConnected) sendtowifi(&meas, client, chipid);
                     break;
 
                     case CLEARDISP:

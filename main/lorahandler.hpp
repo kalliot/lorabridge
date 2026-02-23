@@ -18,7 +18,7 @@ class LoraHandler {
 public:
     LoraHandler(void);
     LoraHandler(float freq, float bandwidth, int spreadingfactor, int codingrate, int power);
-    void send(struct sendmsg *msg);
+    void send(struct tolora *msg);
     void start();
 };
 

@@ -53,7 +53,6 @@ char *flash_read_str(nvs_handle nvsh, const char *name, const char *def, int len
     err = nvs_get_str(nvsh, name , ret, &readlen);
     switch (err) {
         case ESP_OK:
-            ESP_LOGI(TAG,"%s = %s", name, ret);
         break;
 
         case ESP_ERR_NVS_NOT_FOUND:
