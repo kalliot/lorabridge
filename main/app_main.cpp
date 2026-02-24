@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
+#include <stdarg.h>
 #include <time.h>
 #include <math.h>
 
@@ -68,10 +69,7 @@
 
 #define HEALTHYFLAGS_WIFI 1
 #define HEALTHYFLAGS_MQTT 2
-#define HEALTHYFLAGS_TEMP 4
-#define HEALTHYFLAGS_NTP  8
-
-
+#define HEALTHYFLAGS_NTP  4
 
 
 struct netinfo {
@@ -105,6 +103,17 @@ nvs_handle setup_flash;
 
 static void sendInfo(esp_mqtt_client_handle_t client, uint8_t *chipid);
 
+static void display_printf(int line, const char *format, ...)
+{
+    va_list args;
+    char buffer[21];
+
+    va_start(args, format);
+    vsprintf(buffer, format, args);
+    va_end(args);
+    oled_draw_text(0, line, buffer);
+}
+
 static void display_text(const char *str)
 {
     static int line = 0;
@@ -126,6 +135,22 @@ static void display_text(const char *str)
     if (line == 8) line = 0;
 }
 
+static void display_connections(void)
+{
+    display_printf(0, "%s %s %s", (healthyflags & HEALTHYFLAGS_WIFI) ? "WIFI " : "     ",
+                                  (healthyflags & HEALTHYFLAGS_NTP)  ? "NTP  " : "     ",
+                                  (healthyflags & HEALTHYFLAGS_MQTT) ? "MQTT" : "    ");
+}
+
+static void display_received(struct measurement *meas)
+{
+    display_printf(1,"rssi:%.1f snr:%.1f", meas->data.rssi, meas->data.snr);
+}
+
+static void display_sent(unsigned char *targ, int len)
+{
+    display_printf(2,"%0x%0x%0x, %d bytes", targ[0],targ[1],targ[2], len);
+}
 
 static char *getJsonStr(cJSON *js, const char *name)
 {
@@ -170,13 +195,13 @@ static bool handleJson(esp_mqtt_event_handle_t event, uint8_t *chipid)
         if (strlen(fname) > 5)
         {
             ota_start(fname);
+            display_printf(7,"Starting ota update");
         }
     }
     else if (!strcmp(id,"send"))
     {
         struct tolora msg;
 
-        display_text("sending");
         memcpy(msg.origin, &chipid[3], 3);
         cJSON *p = cJSON_GetObjectItem(root, "msg");
         if (p != NULL)
@@ -185,11 +210,13 @@ static bool handleJson(esp_mqtt_event_handle_t event, uint8_t *chipid)
             int devnum = (int) strtol(devstr,NULL,16);
             memcpy(&msg.dev, &devnum,3);
             strcpy(msg.data, getJsonStr(p,"data"));
-            display_text(msg.data);
+            display_connections();
+            display_sent(msg.dev, strlen(msg.data));
         }
         else
         {
             ESP_LOGI(TAG,"field 'msg' not found from json");
+            display_printf(7,"msg not found");
         }
         gpio_set_level(MSG_WAITING_GPIO, true);
         lorahandler.send(&msg);
@@ -220,7 +247,6 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 
     switch ((esp_mqtt_event_id_t)event_id) {
     case MQTT_EVENT_CONNECTED:
-        display_text("MQTT Connected");
         ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
         ESP_LOGI(TAG,"subscribing topic %s", readTopic);
         msg_id = esp_mqtt_client_subscribe(client, readTopic, 0);
@@ -232,13 +258,15 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         sendInfo(client, (uint8_t *) handler_args);
         statistics_getptr()->connectcnt++;
         healthyflags |= HEALTHYFLAGS_MQTT;
+        display_connections();
         break;
 
     case MQTT_EVENT_DISCONNECTED:
-        display_text("MQTT disconnected");
+        healthyflags &= ~HEALTHYFLAGS_MQTT;
         ESP_LOGI(TAG, "MQTT_EVENT_DISCONNECTED");
         statistics_getptr()->disconnectcnt++;
         isConnected = false;
+        display_connections();
         break;
 
     case MQTT_EVENT_SUBSCRIBED:
@@ -253,8 +281,8 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         break;
 
     case MQTT_EVENT_DATA:
-        display_text("received a MQTT message");
         handleJson(event,(uint8_t *) handler_args );
+        display_printf(7,"Received from json");
         break;
 
     case MQTT_EVENT_ERROR:
@@ -264,6 +292,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             log_error_if_nonzero("reported from tls stack", event->error_handle->esp_tls_stack_err);
             log_error_if_nonzero("captured as transport's socket errno",  event->error_handle->esp_transport_sock_errno);
             ESP_LOGI(TAG, "Last errno string (%s)", strerror(event->error_handle->esp_transport_sock_errno));
+            display_printf(7,"Mqtt error");
 
         }
         break;
@@ -283,7 +312,7 @@ void sntp_callback(struct timeval *tv)
     {
         firstSyncDone = true;
         healthyflags |= HEALTHYFLAGS_NTP;
-        display_text("SNTP synced");
+        display_connections();
     }
 }
 
@@ -382,18 +411,18 @@ static void wifi_event_handler(void *event_handler_arg, esp_event_base_t event_b
 
         case WIFI_EVENT_STA_CONNECTED:
             ESP_LOGI(TAG,"WiFi CONNECTED");
-            display_text("WiFi connected");
+            display_connections();
         break;
 
         case WIFI_EVENT_STA_DISCONNECTED:
             ESP_LOGI(TAG,"WiFi lost connection");
-            display_text("WiFi disconnected");
             if(retry_num < WIFI_RECONNECT_RETRYCNT)
             {
                 esp_wifi_connect();
                 retry_num++;
                 ESP_LOGI(TAG,"Retrying to Connect");
             }
+            display_connections();
         break;
 
         default:
@@ -408,10 +437,16 @@ static void ip_event_handler(void *event_handler_arg, esp_event_base_t event_bas
     {
         case IP_EVENT_STA_GOT_IP:
             ESP_LOGI(TAG,"Wifi got IP\n");
-            display_text("WiFi got ip");
             retry_num = 0;
             healthyflags |= HEALTHYFLAGS_WIFI;
+            display_connections();
         break;
+
+        case WIFI_EVENT_STA_DISCONNECTED:
+            healthyflags &= ~HEALTHYFLAGS_WIFI;
+            healthyflags &= ~HEALTHYFLAGS_NTP;
+            display_connections();
+            break;
 
         default:
             ESP_LOGI(TAG,"unknown ip event %d %x", event_id, event_id);
@@ -477,11 +512,13 @@ extern "C" void app_main(void)
     uint8_t chipid[8];
     time_t now, prevStatsTs;
     esp_efuse_mac_get_default(chipid);
+
     
     ESP_LOGI(TAG, "[APP] Startup..");
     ESP_LOGI(TAG, "[APP] Free memory: %d bytes", esp_get_free_heap_size());
     ESP_LOGI(TAG, "[APP] IDF version: %s", esp_get_idf_version());
 
+    ESP_LOGI(TAG, "chipid = %02x%02x%02x%02x", chipid[4],chipid[5],chipid[6],chipid[7]);
 
     esp_log_level_set("*", ESP_LOG_INFO);
     esp_log_level_set("mqtt_client", ESP_LOG_VERBOSE);
@@ -499,9 +536,6 @@ extern "C" void app_main(void)
     gpio_set_level(MSG_WAITING_GPIO, true);
 
     ESP_ERROR_CHECK(oled_init());
-    display_text("Heltec ESP32-S3");
-    display_text("Initializing...");
-
 
     get_appname();
 
@@ -527,7 +561,6 @@ extern "C" void app_main(void)
         sntp_start();
 
         lorahandler = LoraHandler();
-        //LoraHandler lorahandler = LoraHandler(433.5, 250.0, 10, 6, 10);
 
         ESP_LOGI(TAG, "[APP] All init done, app_main, last line.");
 
@@ -555,7 +588,7 @@ extern "C" void app_main(void)
 
             time(&now);
             if ((now - statistics_getptr()->started > 20) &&
-                (healthyflags == (HEALTHYFLAGS_WIFI | HEALTHYFLAGS_MQTT | HEALTHYFLAGS_NTP | HEALTHYFLAGS_TEMP)))
+                (healthyflags == (HEALTHYFLAGS_WIFI | HEALTHYFLAGS_MQTT | HEALTHYFLAGS_NTP)))
             {
                 ota_cancel_rollback();
             }
@@ -590,7 +623,8 @@ extern "C" void app_main(void)
                     break;
 
                     case LORA:
-                        display_text("Got fromlora");
+                        display_connections();
+                        display_received(&meas);
                         if (isConnected) sendtowifi(&meas, client, chipid);
                     break;
 
