@@ -56,7 +56,7 @@ char *flash_read_str(nvs_handle nvsh, const char *name, const char *def, int len
         break;
 
         case ESP_ERR_NVS_NOT_FOUND:
-            ESP_LOGI(TAG,"%s is not initialized yet!");
+            ESP_LOGI(TAG,"%s is not initialized yet!", name);
             free(ret);
             ret = def;
         break;
@@ -66,7 +66,7 @@ char *flash_read_str(nvs_handle nvsh, const char *name, const char *def, int len
             free(ret);
             ret = def;
     }
-    return ret;
+    return (char *) ret;
 }
 
 void flash_write_str(nvs_handle nvsh, char *name, char *value)
@@ -87,7 +87,7 @@ uint16_t flash_read(nvs_handle nvsh, char *name, uint16_t def)
     err = nvs_get_u16(nvsh, name , &ret);
     switch (err) {
         case ESP_OK:
-            ESP_LOGI(TAG,"%s = %d", name, ret);
+            ESP_LOGI(TAG,"%s = %u", name, ret);
         break;
 
         case ESP_ERR_NVS_NOT_FOUND:

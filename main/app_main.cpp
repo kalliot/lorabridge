@@ -48,7 +48,7 @@
 
 
 #define MSG_WAITING_GPIO   ((gpio_num_t) 6)
-#define STATISTICS_INTERVAL 1800
+#define STATISTICS_INTERVAL 7200
 #define ESP_INTR_FLAG_DEFAULT 0
 
 
@@ -145,11 +145,25 @@ static void display_connections(void)
 static void display_received(struct measurement *meas)
 {
     display_printf(1,"rssi:%.1f snr:%.1f", meas->data.rssi, meas->data.snr);
+    display_printf(2,"client power %d", meas->data.count);
 }
 
-static void display_sent(unsigned char *targ, int len)
+static void display_sent(enum wifimsgid toloraid, unsigned char *targ, int numericval)
 {
-    display_printf(2,"%0x%0x%0x, %d bytes", targ[0],targ[1],targ[2], len);
+    switch (toloraid)
+    {
+        case changeinterval:
+            display_printf(3,"chg interval %d", numericval);
+        break;
+
+        case displaytext:
+            display_printf(3,"disp txt, len=%d", numericval);
+        break;
+
+        default:
+            ESP_LOGI(TAG,"toloraid %d not handled in display_sent().");
+    }
+    display_printf(4,"targ=%0x%0x%0x%0x", targ[0],targ[1],targ[2],targ[3]);
 }
 
 static char *getJsonStr(cJSON *js, const char *name)
@@ -167,6 +181,29 @@ static char *getJsonStr(cJSON *js, const char *name)
     else ESP_LOGI(TAG,"%s not found from json", name);
     return (char *) "\0";
 }
+
+static bool getJsonInt(cJSON *js, const char *name, int *val)
+{
+    bool ret = false;
+
+    cJSON *item = cJSON_GetObjectItem(js, name);
+    if (item != NULL)
+    {
+        if (cJSON_IsNumber(item))
+        {
+            if (item->valueint != *val)
+            {
+                ret = true;
+                *val = item->valueint;
+            }
+            else ESP_LOGI(TAG,"%s is not changed", name);
+        }
+        else ESP_LOGI(TAG,"%s is not a number", name);
+    }
+    else ESP_LOGI(TAG,"%s not found from json", name);
+    return ret;
+}
+
 
 
 static void log_error_if_nonzero(const char *message, int error_code)
@@ -198,30 +235,57 @@ static bool handleJson(esp_mqtt_event_handle_t event, uint8_t *chipid)
             display_printf(7,"Starting ota update");
         }
     }
-    else if (!strcmp(id,"send"))
+    else if (!strcmp(id,"sendtext"))
     {
         struct tolora msg;
 
-        memcpy(msg.origin, &chipid[3], 3);
+        memcpy(msg.bridgeid, &chipid[4], 4);
         cJSON *p = cJSON_GetObjectItem(root, "msg");
         if (p != NULL)
         {
             char *devstr = getJsonStr(p,"dev");
             int devnum = (int) strtol(devstr,NULL,16);
-            memcpy(&msg.dev, &devnum,3);
-            strcpy(msg.data, getJsonStr(p,"data"));
+            memcpy(&msg.devid, &devnum,4);
+            msg.msgid = displaytext;
+            strcpy(msg.data.text, getJsonStr(p,"data"));
             display_connections();
-            display_sent(msg.dev, strlen(msg.data));
+            display_sent(msg.msgid, msg.devid, strlen(msg.data.text));
+            lorahandler.send(&msg);
+            gpio_set_level(MSG_WAITING_GPIO, true);
         }
         else
         {
             ESP_LOGI(TAG,"field 'msg' not found from json");
             display_printf(7,"msg not found");
         }
-        gpio_set_level(MSG_WAITING_GPIO, true);
-        lorahandler.send(&msg);
-    }
 
+    }
+    else if (!strcmp(id,"changeinterval"))
+    {
+        struct tolora msg;
+
+        memcpy(msg.bridgeid, &chipid[4], 4);
+        cJSON *p = cJSON_GetObjectItem(root, "msg");
+        if (p != NULL)
+        {
+            char *devstr = getJsonStr(p,"dev");
+            int devnum = (int) strtol(devstr,NULL,16);
+            memcpy(&msg.devid, &devnum,4);
+
+            msg.msgid = changeinterval;
+            msg.data.interval = 120; // default
+            getJsonInt(p, "data", (int *) &msg.data.interval);
+            display_connections();
+            display_sent(msg.msgid, msg.devid, msg.data.interval);
+            lorahandler.send(&msg);
+            gpio_set_level(MSG_WAITING_GPIO, true);
+        }
+        else
+        {
+            ESP_LOGI(TAG,"field 'msg' not found from json");
+            display_printf(7,"msg not found");
+        }
+    }
     cJSON_Delete(root);
     return ret;
 }
@@ -251,6 +315,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         ESP_LOGI(TAG,"subscribing topic %s", readTopic);
         msg_id = esp_mqtt_client_subscribe(client, readTopic, 0);
         ESP_LOGI(TAG, "sent subscribe successful, msg_id=%d", msg_id);
+        display_printf(7,"           ");
         gpio_set_level(MSG_WAITING_GPIO, false);
 
         isConnected = true;
@@ -473,7 +538,6 @@ void wifi_connect(char *ssid, char *password)
     strcpy((char*)wifi_configuration.sta.password, password);
 
     esp_wifi_set_config(WIFI_IF_STA, &wifi_configuration);
-    //esp_wifi_set_config((wifi_interface_t) ESP_IF_WIFI_STA, &wifi_configuration);
     esp_wifi_start();
     esp_wifi_set_mode(WIFI_MODE_STA);
     esp_wifi_connect();

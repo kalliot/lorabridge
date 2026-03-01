@@ -15,9 +15,16 @@ enum loramsgid
     temperatures,   // remote device is sending a set of temperatures
     brightness,     // remote device sends brightness
     humidity,       // remote device sends humidity
-    timeout,        // bridge may send a timeout config parameter to remote device.
-    settarget,      // bridge sends this to remote, as a setup for future measurements
-    displaytext     // show displaytext in the screen.
+    timeout         // bridge may send a timeout config parameter to remote device.
+};
+
+enum wifimsgid
+{
+    increasepower,
+    decreasepower,
+    changeinterval,
+    pair,
+    displaytext
 };
 
 #pragma pack(1)
@@ -41,12 +48,14 @@ struct brightness
 };
 
 
+// max payload size is 51 bytes. this means whole fromlora and tolora struct
 struct fromlora
 {
     int len;
     int battvoltage;
     unsigned char clientid[3];
     unsigned char bridgeid[3];
+    unsigned char powerused;
     unsigned char msgid;
     union
     {
@@ -58,11 +67,16 @@ struct fromlora
     } data;
 };
 
+
 struct tolora
 {
-    unsigned char origin[3];
-    unsigned char dev[3];
-    char data[50];
+    unsigned char bridgeid[4];
+    unsigned char devid[4];
+    enum wifimsgid msgid;
+        union {
+        char text[51-9];
+        unsigned int interval;
+    } data;
 };
 
 

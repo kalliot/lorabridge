@@ -12,6 +12,7 @@ static Module mod(&hal, RADIO_NSS, RADIO_IRQ, RADIO_RST, RADIO_GPIO);
 static SX1262 radio(&mod);
 static char rxBuf[64]; // muista alustaa eka merkki nollaksi constructorissa
 static QueueHandle_t send_queue;    
+static int clientPower = 2; // clients speculated power
 
 
 static char *interpret_lorapacket(struct fromlora *packet)
@@ -26,13 +27,13 @@ static char *interpret_lorapacket(struct fromlora *packet)
     switch (packet->msgid)
     {
         case temperatures:
-            ESP_LOGI(TAG, "Got temperetures, cnt=%d", packet->data.temperatures.cnt);
-            sprintf(&buff[len],",\"temperature\":[");
+            ESP_LOGI(TAG, "Got temperatures, cnt=%d", packet->data.temperatures.cnt);
+            sprintf(&buff[len],",\"temperatures\":[");
             len = strlen(buff);
             for (int i=0; i < packet->data.temperatures.cnt; i++)
             {
                 if (i==8) break;
-                sprintf(&buff[len],"{\"value\":%.2f},", packet->data.temperatures.measurements[i]);
+                sprintf(&buff[len],"%.2f,", packet->data.temperatures.measurements[i]);
                 len = strlen(buff);
             }
             buff[len-1] = ']';
@@ -71,6 +72,7 @@ static void reader(void *arg)
 {
     int16_t rxState;
     int timeoutCnt=0;
+    struct tolora msg;
 
     ESP_LOGI(TAG, "Now in lorareader");
     while (1)
@@ -85,9 +87,31 @@ static void reader(void *arg)
             meas.id = LORA;
             meas.data.rssi = radio.getRSSI();
             meas.data.snr  = radio.getSNR();
+            clientPower = ((struct fromlora *)rxBuf)->powerused;
+            meas.data.count = clientPower;
+            ESP_LOGI(TAG, "client user power %u", clientPower);
+
+            if (meas.data.rssi < -100 && clientPower < 16)
+            {
+                vTaskDelay(pdMS_TO_TICKS(300));
+                msg.msgid = increasepower;
+                radio.transmit((unsigned char *) &msg, sizeof(struct tolora));
+                ESP_LOGI(TAG, "rssi was %.1f, asking remote to increase power",meas.data.rssi);
+                vTaskDelay(pdMS_TO_TICKS(300));
+            }
+
+            else if (meas.data.rssi > -90 && clientPower > 1)
+            {
+                vTaskDelay(pdMS_TO_TICKS(300));
+                msg.msgid = decreasepower;
+                radio.transmit((unsigned char *) &msg, sizeof(struct tolora));
+                ESP_LOGI(TAG, "rssi was %.1f, asking remote to decrease power",meas.data.rssi);
+                vTaskDelay(pdMS_TO_TICKS(300));
+            }
+
             strcpy((char *)meas.data.recdata, interpret_lorapacket((struct fromlora *) rxBuf));
             xQueueSend(evt_queue, &meas,0);
-            struct tolora msg;
+
             uint16_t qcnt = uxQueueMessagesWaiting(send_queue);
             for (int i=0;i<qcnt;i++)
             {
@@ -132,7 +156,7 @@ static void reader(void *arg)
 
 LoraHandler::LoraHandler(void)
 {
-    LoraHandler(433.5, 250.0, 10, 6, 10);
+    LoraHandler(433.75, 250.0, 10, 6, 10);
 }
 
 LoraHandler::LoraHandler(float freq, float bandwidth, int spreadingfactor, int codingrate, int power)
