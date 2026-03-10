@@ -1,25 +1,11 @@
-menu "Sensors Configuration"
+menu "LoraBridge Configuration"
 
-    config SETUPLED_GPIO
-        int "Setup led gpio"
+    config MSGWAITING_GPIO
+        int "Message waiting led gpio"
         range 0 36
-        default 12
+        default 6
         help
-            This led is lit when config web ap server is active.
-
-    config WLANSTATUS_GPIO
-        int "Wlan status led gpio"
-        range 0 36
-        default 14
-        help
-            This led is lit when wlan is connected.
-
-    config MQTTSTATUS_GPIO
-        int "MQTT status led gpio"
-        range 0 36
-        default 13
-        help
-            This led is lit when mqtt is in connected state.
+            This led is lit when there is one or more messages waiting for lora clients.
 
     config ESP_WIFI_SSID
         string "WiFi SSID"
@@ -57,7 +43,6 @@ menu "Sensors Configuration"
         default "https://192.168.101.233:8070/ota"
         help
             Base URL of server which hosts the firmware images.
-
 
     config ENABLE_PARTIAL_HTTP_DOWNLOAD
         bool "Enable partial HTTP download"

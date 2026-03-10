@@ -24,7 +24,12 @@ enum wifimsgid
     decreasepower,
     changeinterval,
     pair,
-    displaytext
+    displaytext,
+    setruntime,
+    unpair,
+
+    otaupdate,
+    idnone = 0xff
 };
 
 #pragma pack(1)
@@ -32,19 +37,19 @@ enum wifimsgid
 struct temperature
 {
     int cnt;
-    float measurements[8];
+    float measurements[4];
 };
 
 struct humidity
 {
     int cnt;
-    float measurements[8];
+    float measurements[4];
 };
 
 struct brightness
 {
     int cnt;
-    int measurements[8];
+    int measurements[4];
 };
 
 
@@ -53,8 +58,8 @@ struct fromlora
 {
     int len;
     int battvoltage;
-    unsigned char clientid[3];
-    unsigned char bridgeid[3];
+    unsigned char clientid[4];
+    unsigned char bridgeid[4];
     unsigned char powerused;
     unsigned char msgid;
     union
@@ -62,8 +67,6 @@ struct fromlora
         struct temperature temperatures;
         struct humidity humidities;
         struct brightness brightnesses;
-        unsigned char settarget[4];
-        char displaytext[20];
     } data;
 };
 
@@ -73,7 +76,7 @@ struct tolora
     unsigned char bridgeid[4];
     unsigned char devid[4];
     enum wifimsgid msgid;
-        union {
+    union {
         char text[51-9];
         unsigned int interval;
     } data;
@@ -107,7 +110,7 @@ extern char jsondata[];
 extern uint16_t sendcnt;
 extern nvs_handle setup_flash;
 
-#define MSG_WAITING_GPIO   ((gpio_num_t) 6)
 #define MIN_EPOCH   1650000000
+#define MSG_WAITING_GPIO   ((gpio_num_t) CONFIG_MSGWAITING_GPIO)
 
 #endif

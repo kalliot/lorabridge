@@ -13,17 +13,39 @@ static SX1262 radio(&mod);
 static char rxBuf[64]; // muista alustaa eka merkki nollaksi constructorissa
 static QueueHandle_t send_queue;    
 static int clientPower = 2; // clients speculated power
+static bool pairingAllowed = true;
 
+// TODO: all allowed remotes should be stored in flash
+//       This deny should happen when bridge is not in pairing mode.
+
+static bool isRemotePaired(struct fromlora *packet)
+{
+    char remotemac[9];
+    bool ret = false;
+
+    sprintf(remotemac,"%02x%02x%02x%02x",packet->clientid[0],
+                                         packet->clientid[1],
+                                         packet->clientid[2],
+                                         packet->clientid[3]);
+    if (!strcmp(remotemac,"d004a5a5"))
+        ret = true;
+    else
+    {
+        ESP_LOGE(TAG,"remote %s is not paired", remotemac);
+    }
+    return ret;
+}
 
 static char *interpret_lorapacket(struct fromlora *packet)
 {
     static char buff[120];
     int len;
 
-    len = sprintf(buff,"{\"batt\":%d,\"dev\":\"%02x%02x%02x\"", packet->battvoltage,
-                                                                packet->clientid[0],
-                                                                packet->clientid[1],
-                                                                packet->clientid[2]);
+    len = sprintf(buff,"{\"batt\":%d,\"dev\":\"%02x%02x%02x%02x\"", packet->battvoltage,
+                                                                    packet->clientid[0],
+                                                                    packet->clientid[1],
+                                                                    packet->clientid[2],
+                                                                    packet->clientid[3]);
     switch (packet->msgid)
     {
         case temperatures:
@@ -32,7 +54,7 @@ static char *interpret_lorapacket(struct fromlora *packet)
             len = strlen(buff);
             for (int i=0; i < packet->data.temperatures.cnt; i++)
             {
-                if (i==8) break;
+                if (i==4) break;
                 sprintf(&buff[len],"%.2f,", packet->data.temperatures.measurements[i]);
                 len = strlen(buff);
             }
@@ -44,7 +66,7 @@ static char *interpret_lorapacket(struct fromlora *packet)
             len = strlen(buff);
             for (int i=0; i < packet->data.brightnesses.cnt; i++)
             {
-                if (i==8) break;
+                if (i==4) break;
                 sprintf(&buff[len],"{\"value\":%d},", packet->data.brightnesses.measurements[i]);
                 len = strlen(buff);
             }
@@ -56,7 +78,7 @@ static char *interpret_lorapacket(struct fromlora *packet)
             len = strlen(buff);
             for (int i=0; i < packet->data.humidities.cnt; i++)
             {
-                if (i==8) break;
+                if (i==4) break;
                 sprintf(&buff[len],"{\"value\":%.2f},", packet->data.humidities.measurements[i]);
                 len = strlen(buff);
             }
@@ -81,6 +103,11 @@ static void reader(void *arg)
         rxState = radio.receive((uint8_t*)rxBuf, sizeof(rxBuf), 5000);
         if (rxState == RADIOLIB_ERR_NONE)
         {
+            if (!pairingAllowed && !isRemotePaired((struct fromlora *) rxBuf))
+            {
+                continue;
+            }
+
             timeoutCnt = 0;
             ESP_LOGI(TAG, "RX: %s", rxBuf);
             struct measurement meas;
@@ -95,6 +122,7 @@ static void reader(void *arg)
             {
                 vTaskDelay(pdMS_TO_TICKS(300));
                 msg.msgid = increasepower;
+                radio.setOutputPower(clientPower + 1);
                 radio.transmit((unsigned char *) &msg, sizeof(struct tolora));
                 ESP_LOGI(TAG, "rssi was %.1f, asking remote to increase power",meas.data.rssi);
                 vTaskDelay(pdMS_TO_TICKS(300));
@@ -104,6 +132,7 @@ static void reader(void *arg)
             {
                 vTaskDelay(pdMS_TO_TICKS(300));
                 msg.msgid = decreasepower;
+                radio.setOutputPower(clientPower + 1);
                 radio.transmit((unsigned char *) &msg, sizeof(struct tolora));
                 ESP_LOGI(TAG, "rssi was %.1f, asking remote to decrease power",meas.data.rssi);
                 vTaskDelay(pdMS_TO_TICKS(300));
@@ -118,13 +147,24 @@ static void reader(void *arg)
                 ESP_LOGI(TAG, "%u messages in sendqueue", qcnt);
                 if (xQueueReceive(send_queue, &msg, 10))
                 {
-                    vTaskDelay(pdMS_TO_TICKS(300));
-                    int16_t txState = radio.transmit((unsigned char *) &msg, sizeof(struct tolora));
-
-                    if (txState == RADIOLIB_ERR_NONE)
+                    // ----------------------------------------------------------------------------------------
+                    // TODO: every paired client should have its own send_queue
+                    //       Now these "not to this client" messages are just thrown out.
+                    // ----------------------------------------------------------------------------------------
+                    if (memcmp(msg.devid, ((struct fromlora *)rxBuf)->clientid, 4))
                     {
-                        ESP_LOGI(TAG, "datalen %d", sizeof(struct tolora));
-                        ESP_LOGI(TAG, "** Message sent successfully **");
+                        ESP_LOGI(TAG, "mqtt message is not for this client");
+                    }
+                    else
+                    {
+                        vTaskDelay(pdMS_TO_TICKS(300));
+                        int16_t txState = radio.transmit((unsigned char *) &msg, sizeof(struct tolora));
+
+                        if (txState == RADIOLIB_ERR_NONE)
+                        {
+                            ESP_LOGI(TAG, "datalen %d", sizeof(struct tolora));
+                            ESP_LOGI(TAG, "** Message sent successfully **");
+                        }
                     }
                 }
                 else
@@ -156,7 +196,8 @@ static void reader(void *arg)
 
 LoraHandler::LoraHandler(void)
 {
-    LoraHandler(433.75, 250.0, 10, 6, 10);
+  //LoraHandler(433.75, 250.0, 10, 6, 10);
+    LoraHandler(433.75, 25.0,  10, 6, 10);
 }
 
 LoraHandler::LoraHandler(float freq, float bandwidth, int spreadingfactor, int codingrate, int power)
@@ -173,7 +214,7 @@ LoraHandler::LoraHandler(float freq, float bandwidth, int spreadingfactor, int c
         while (true) vTaskDelay(pdMS_TO_TICKS(1000));
     }
 
-    vTaskDelay(pdMS_TO_TICKS(1500));
+    vTaskDelay(pdMS_TO_TICKS(500));
 
     radio.setFrequency(freq);
     radio.setBandwidth(bandwidth);
@@ -182,7 +223,7 @@ LoraHandler::LoraHandler(float freq, float bandwidth, int spreadingfactor, int c
     radio.setOutputPower(power);
     radio.setCRC(true);
     
-    vTaskDelay(pdMS_TO_TICKS(1500));
+    vTaskDelay(pdMS_TO_TICKS(500));
 }    
 
 void LoraHandler::start()

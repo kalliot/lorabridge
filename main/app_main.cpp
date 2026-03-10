@@ -47,7 +47,7 @@
 #include "factoryreset.h"
 
 
-#define MSG_WAITING_GPIO   ((gpio_num_t) 6)
+
 #define STATISTICS_INTERVAL 7200
 #define ESP_INTR_FLAG_DEFAULT 0
 
@@ -80,6 +80,17 @@ struct netinfo {
     char *mqtt_prefix;
 };
 
+enum displayline
+{
+    commstatus,
+    eventtime,
+    clientrssi,
+    clientpower,
+    sentmsg,
+    targetaddr,
+    free_1,
+    information
+};
 
 // globals
 
@@ -103,7 +114,7 @@ nvs_handle setup_flash;
 
 static void sendInfo(esp_mqtt_client_handle_t client, uint8_t *chipid);
 
-static void display_printf(int line, const char *format, ...)
+static void display_printf(enum displayline line, const char *format, ...)
 {
     va_list args;
     char buffer[21];
@@ -112,6 +123,7 @@ static void display_printf(int line, const char *format, ...)
     vsprintf(buffer, format, args);
     va_end(args);
     oled_draw_text(0, line, buffer);
+    vTaskDelay(pdMS_TO_TICKS(150));
 }
 
 static void display_text(const char *str)
@@ -137,34 +149,29 @@ static void display_text(const char *str)
 
 static void display_connections(void)
 {
-    display_printf(0, "%s %s %s", (healthyflags & HEALTHYFLAGS_WIFI) ? "WIFI " : "     ",
-                                  (healthyflags & HEALTHYFLAGS_NTP)  ? "NTP  " : "     ",
-                                  (healthyflags & HEALTHYFLAGS_MQTT) ? "MQTT" : "    ");
+    display_printf(commstatus, "%s %s %s",  (healthyflags & HEALTHYFLAGS_WIFI) ? "WIFI " : "     ",
+                                            (healthyflags & HEALTHYFLAGS_NTP)  ? "NTP  " : "     ",
+                                            (healthyflags & HEALTHYFLAGS_MQTT) ? "MQTT" : "    ");
 }
 
 static void display_received(struct measurement *meas)
 {
-    display_printf(1,"rssi:%.1f snr:%.1f", meas->data.rssi, meas->data.snr);
-    display_printf(2,"client power %d", meas->data.count);
+    time_t now;
+    struct tm now_local;
+
+    time(&now);
+    localtime_r(&now, &now_local);
+    display_printf(eventtime, "%02d.%02d.%04d %02d:%02d:%02d",
+                        now_local.tm_mday,
+                        now_local.tm_mon+1,
+                        now_local.tm_year+1900,
+                        now_local.tm_hour,
+                        now_local.tm_min,
+                        now_local.tm_sec);
+    display_printf(clientrssi, "rssi:%.1f snr:%.1f", meas->data.rssi, meas->data.snr);
+    display_printf(clientpower, "client power %d", meas->data.count);
 }
 
-static void display_sent(enum wifimsgid toloraid, unsigned char *targ, int numericval)
-{
-    switch (toloraid)
-    {
-        case changeinterval:
-            display_printf(3,"chg interval %d", numericval);
-        break;
-
-        case displaytext:
-            display_printf(3,"disp txt, len=%d", numericval);
-        break;
-
-        default:
-            ESP_LOGI(TAG,"toloraid %d not handled in display_sent().");
-    }
-    display_printf(4,"targ=%0x%0x%0x%0x", targ[0],targ[1],targ[2],targ[3]);
-}
 
 static char *getJsonStr(cJSON *js, const char *name)
 {
@@ -213,78 +220,203 @@ static void log_error_if_nonzero(const char *message, int error_code)
     }
 }
 
-// dp = '{"origin":"6ab8","dev":"aaaa","data":"----> testi <-----"}';
+static void swab(unsigned char *src, unsigned char *targ, int len)
+{
+    for (int i=0,j=len-1; i < len; i++, j--)
+    {
+        targ[i]=src[j];
+    }
+}
 
+void buildLoraHdr(struct tolora *msg, cJSON *p, uint8_t *chipid)
+{
+    char *endptr;
+
+    ESP_LOGI(TAG,"Chipid is %02x%02x%02x%02x",chipid[2],chipid[3],chipid[4],chipid[5]);
+    memcpy(msg->bridgeid, &chipid[2], 4);
+    char *devstr = getJsonStr(p,"dev");
+    ESP_LOGI(TAG,"devstr=%s", devstr);
+
+    unsigned int devnum = (unsigned int) strtoul(devstr, &endptr ,16);
+    unsigned char *dev=(unsigned char *) &devnum;
+
+    swab(dev, msg->devid, 4);
+    ESP_LOGI(TAG,"BridgeId is %02x%02x%02x%02x",msg->bridgeid[0],msg->bridgeid[1],msg->bridgeid[2],msg->bridgeid[3]);
+    ESP_LOGI(TAG,"DevId is %02x%02x%02x%02x",msg->devid[0],msg->devid[1],msg->devid[2],msg->devid[3]);
+}
+
+
+
+struct {
+    const char *name;
+    enum wifimsgid id;
+} idtable[] =
+{
+    {"increasepower",  increasepower  },
+    {"decreasepower",  decreasepower  },
+    {"changeinterval", changeinterval },
+    {"pair",           pair           },
+    {"sendtext",       displaytext    },
+    {"setruntime",     setruntime     },
+    {"unpair",         unpair         },
+    {"otaupdate",      otaupdate      },
+    { NULL,            idnone         },
+};
+
+static enum wifimsgid enumerizeId(char *id)
+{
+    for (int i=0; idtable[i].name != NULL; i++)
+    {
+        if (!strcmp(id,idtable[i].name))
+            return idtable[i].id;
+    }
+    return idnone;
+}
+
+// dp = '{"origin":"6ab8","dev":"aaaa","data":"----> testi <-----"}';
 
 static bool handleJson(esp_mqtt_event_handle_t event, uint8_t *chipid)
 {
     cJSON *root = cJSON_Parse(event->data);
     bool ret = false;
     char id[20];
+    enum wifimsgid msgid;
+    int sendlen = 0;
+    struct tolora msg;
 
     if (root != NULL)
     {
         strcpy(id,getJsonStr(root,"id"));
     }
-    if (!strcmp(id,"otaupdate"))
+    msgid = enumerizeId(id);
+    ESP_LOGI(TAG,"enumerized id = %d", msgid);
+
+    switch (msgid)
     {
-        char *fname = getJsonStr(root,"file");
-        if (strlen(fname) > 5)
+        case increasepower:
+        case decreasepower:
+            // these never come from mqtt
+        break;
+
+        case changeinterval:
         {
-            ota_start(fname);
-            display_printf(7,"Starting ota update");
+            cJSON *p = cJSON_GetObjectItem(root, "msg");
+            if (p != NULL)
+            {
+                buildLoraHdr(&msg, p, chipid);
+                msg.msgid = changeinterval;
+                msg.data.interval = 120; // default
+                getJsonInt(p, "data", (int *) &msg.data.interval);
+                sendlen = sizeof(struct tolora);
+                display_printf(sentmsg,"chg interval %d", msg.data.interval);
+            }
+            else
+            {
+                ESP_LOGI(TAG,"field 'msg' not found from json");
+                display_printf(information,"msg not found");
+            }
         }
+        break;
+
+        case pair:
+        {
+            cJSON *p = cJSON_GetObjectItem(root, "msg");
+            if (p != NULL)
+            {
+                buildLoraHdr(&msg, p, chipid);
+                msg.msgid = pair;
+                sendlen = 9;
+                display_printf(sentmsg,"pairing, len=%d", sendlen);
+            }
+            else
+            {
+                ESP_LOGI(TAG,"field 'msg' not found from json");
+                display_printf(information,"msg not found");
+            }
+
+        }
+        break;
+
+        case displaytext:
+        {
+            cJSON *p = cJSON_GetObjectItem(root, "msg");
+            if (p != NULL)
+            {
+                buildLoraHdr(&msg, p, chipid);
+                msg.msgid = displaytext;
+                strcpy(msg.data.text, getJsonStr(p,"data"));
+                sendlen = strlen(msg.data.text);
+                display_printf(sentmsg,"disp txt, len=%d", sendlen);
+            }
+            else
+            {
+                ESP_LOGI(TAG,"field 'msg' not found from json");
+                display_printf(information,"msg not found");
+            }
+        }
+        break;
+
+        case setruntime:
+        {
+            cJSON *p = cJSON_GetObjectItem(root, "msg");
+            if (p != NULL)
+            {
+                buildLoraHdr(&msg, p, chipid);
+                msg.msgid = setruntime;
+                sendlen = sizeof(struct tolora);
+                display_printf(sentmsg,"setruntime, len=%d", sendlen);
+            }
+            else
+            {
+                ESP_LOGI(TAG,"field 'msg' not found from json");
+                display_printf(information,"msg not found");
+            }
+        }
+        break;
+
+        case unpair:
+        {
+            cJSON *p = cJSON_GetObjectItem(root, "msg");
+            if (p != NULL)
+            {
+                buildLoraHdr(&msg, p, chipid);
+                msg.msgid = unpair;
+                sendlen = 9;
+                display_printf(sentmsg,"unpair, len=%d", sendlen);
+            }
+            else
+            {
+                ESP_LOGI(TAG,"field 'msg' not found from json");
+                display_printf(information,"msg not found");
+            }
+        }
+        break;
+
+        case otaupdate:
+        {
+            char *fname = getJsonStr(root,"file");
+            if (strlen(fname) > 5)
+            {
+                ota_start(fname);
+                display_printf(information, "Starting ota update");
+            }
+        }
+        break;
+
+        case idnone:
+        break;
+
+        default:
+            ESP_LOGI(TAG,"toloraid %d not handled in handleJson().", msgid);
+        break;
     }
-    else if (!strcmp(id,"sendtext"))
+
+    if (sendlen)
     {
-        struct tolora msg;
-
-        memcpy(msg.bridgeid, &chipid[4], 4);
-        cJSON *p = cJSON_GetObjectItem(root, "msg");
-        if (p != NULL)
-        {
-            char *devstr = getJsonStr(p,"dev");
-            int devnum = (int) strtol(devstr,NULL,16);
-            memcpy(&msg.devid, &devnum,4);
-            msg.msgid = displaytext;
-            strcpy(msg.data.text, getJsonStr(p,"data"));
-            display_connections();
-            display_sent(msg.msgid, msg.devid, strlen(msg.data.text));
-            lorahandler.send(&msg);
-            gpio_set_level(MSG_WAITING_GPIO, true);
-        }
-        else
-        {
-            ESP_LOGI(TAG,"field 'msg' not found from json");
-            display_printf(7,"msg not found");
-        }
-
-    }
-    else if (!strcmp(id,"changeinterval"))
-    {
-        struct tolora msg;
-
-        memcpy(msg.bridgeid, &chipid[4], 4);
-        cJSON *p = cJSON_GetObjectItem(root, "msg");
-        if (p != NULL)
-        {
-            char *devstr = getJsonStr(p,"dev");
-            int devnum = (int) strtol(devstr,NULL,16);
-            memcpy(&msg.devid, &devnum,4);
-
-            msg.msgid = changeinterval;
-            msg.data.interval = 120; // default
-            getJsonInt(p, "data", (int *) &msg.data.interval);
-            display_connections();
-            display_sent(msg.msgid, msg.devid, msg.data.interval);
-            lorahandler.send(&msg);
-            gpio_set_level(MSG_WAITING_GPIO, true);
-        }
-        else
-        {
-            ESP_LOGI(TAG,"field 'msg' not found from json");
-            display_printf(7,"msg not found");
-        }
+        display_connections();
+        display_printf(targetaddr, "targ=%0x%0x%0x%0x", msg.devid[0], msg.devid[1], msg.devid[2], msg.devid[3]);
+        lorahandler.send(&msg);
+        gpio_set_level(MSG_WAITING_GPIO, true);
     }
     cJSON_Delete(root);
     return ret;
@@ -315,7 +447,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         ESP_LOGI(TAG,"subscribing topic %s", readTopic);
         msg_id = esp_mqtt_client_subscribe(client, readTopic, 0);
         ESP_LOGI(TAG, "sent subscribe successful, msg_id=%d", msg_id);
-        display_printf(7,"           ");
+        display_printf(information,"           ");
         gpio_set_level(MSG_WAITING_GPIO, false);
 
         isConnected = true;
@@ -347,7 +479,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 
     case MQTT_EVENT_DATA:
         handleJson(event,(uint8_t *) handler_args );
-        display_printf(7,"Received from json");
+        display_printf(information,"Received from json");
         break;
 
     case MQTT_EVENT_ERROR:
@@ -357,8 +489,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             log_error_if_nonzero("reported from tls stack", event->error_handle->esp_tls_stack_err);
             log_error_if_nonzero("captured as transport's socket errno",  event->error_handle->esp_transport_sock_errno);
             ESP_LOGI(TAG, "Last errno string (%s)", strerror(event->error_handle->esp_transport_sock_errno));
-            display_printf(7,"Mqtt error");
-
+            if (isConnected) display_printf(information,"Mqtt error");
         }
         break;
     default:
@@ -424,10 +555,11 @@ static void sendtowifi(struct measurement *meas, esp_mqtt_client_handle_t client
 
     sprintf(loraTopic,"%s/%s/%02x%02x%02x/loradata",
          comminfo->mqtt_prefix, appname, chipid[3],chipid[4],chipid[5]);
-    sprintf(jsondata, "{\"bridge\":\"%02x%02x%02x\",\"ts\":%jd,\"id\":\"loradata\",\"rssi\":%.1f,\"snr\":%.1f,\"data\":%s}",
+    sprintf(jsondata, "{\"bridge\":\"%02x%02x%02x\",\"ts\":%jd,\"id\":\"loradata\",\"rssi\":%.1f,\"snr\":%.1f,\"power\":%d,\"data\":%s}",
                 chipid[3],chipid[4],chipid[5],now,
                 meas->data.rssi,
                 meas->data.snr,
+                meas->data.count,
                 meas->data.recdata);
     esp_mqtt_client_publish(client, loraTopic, jsondata , 0, 0, 1);
     statistics_getptr()->sendcnt++;
