@@ -42,7 +42,18 @@ void flash_erase_all(nvs_handle nvsh)
     if (err != ESP_OK) ESP_LOGD(TAG,"flash erase failed");
 }
 
-char *flash_read_str(nvs_handle nvsh, const char *name, const char *def, int len)
+
+void flash_erase(nvs_handle nvsh, const char *name)
+{
+    esp_err_t err;
+    ESP_LOGI(TAG,"Erasing %s from NVS", name);
+    err = nvs_erase_key(nvsh, name);
+    if (err == ESP_ERR_NVS_NOT_FOUND)
+        ESP_LOGI(TAG,"%s was not found", name);
+}
+
+
+char *flash_read_str(nvs_handle nvsh, const char *name, char *def, int len)
 {
     esp_err_t err;
     unsigned int readlen = len;
@@ -69,7 +80,7 @@ char *flash_read_str(nvs_handle nvsh, const char *name, const char *def, int len
     return (char *) ret;
 }
 
-void flash_write_str(nvs_handle nvsh, char *name, char *value)
+void flash_write_str(nvs_handle nvsh, const char *name, char *value)
 {
     esp_err_t err;
 
@@ -115,11 +126,11 @@ uint32_t flash_read32(nvs_handle nvsh, char *name, uint32_t def)
     esp_err_t err;
     uint32_t ret;
 
-    ESP_LOGD(TAG,"Reading %s from NVS", name);
+    ESP_LOGI(TAG,"Reading [%s] from NVS", name);
     err = nvs_get_u32(nvsh, name , &ret);
     switch (err) {
         case ESP_OK:
-            ESP_LOGI(TAG,"%s = %d", name, ret);
+            ESP_LOGI(TAG,"%s = %u", name, ret);
         break;
 
         case ESP_ERR_NVS_NOT_FOUND:

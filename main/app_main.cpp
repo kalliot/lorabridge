@@ -45,7 +45,7 @@
 #include "mqtt_client.h"
 #include "apwebserver/server.h"
 #include "factoryreset.h"
-
+#include "clients.h"
 
 
 #define STATISTICS_INTERVAL 7200
@@ -91,6 +91,7 @@ enum displayline
     free_1,
     information
 };
+
 
 // globals
 
@@ -456,6 +457,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         statistics_getptr()->connectcnt++;
         healthyflags |= HEALTHYFLAGS_MQTT;
         display_connections();
+        clients_publish_devices(client, (uint8_t *) handler_args);
         break;
 
     case MQTT_EVENT_DISCONNECTED:
@@ -555,12 +557,12 @@ static void sendtowifi(struct measurement *meas, esp_mqtt_client_handle_t client
 
     sprintf(loraTopic,"%s/%s/%02x%02x%02x/loradata",
          comminfo->mqtt_prefix, appname, chipid[3],chipid[4],chipid[5]);
-    sprintf(jsondata, "{\"bridge\":\"%02x%02x%02x\",\"ts\":%jd,\"id\":\"loradata\",\"rssi\":%.1f,\"snr\":%.1f,\"power\":%d,\"data\":%s}",
+    sprintf(jsondata, "{\"bridge\":\"%02x%02x%02x\",\"ts\":%jd,\"id\":\"loradata\",\"data\":{%s,\"rssi\":%.1f,\"snr\":%.1f,\"power\":%d}}",
                 chipid[3],chipid[4],chipid[5],now,
+                meas->data.recdata,
                 meas->data.rssi,
                 meas->data.snr,
-                meas->data.count,
-                meas->data.recdata);
+                meas->data.count);
     esp_mqtt_client_publish(client, loraTopic, jsondata , 0, 0, 1);
     statistics_getptr()->sendcnt++;
 }
@@ -680,19 +682,19 @@ void wifi_connect(char *ssid, char *password)
 struct netinfo *get_networkinfo()
 {
     static struct netinfo ni;
-    const char *default_ssid = "XXXXXXXX";
+    char *default_ssid = (char *) "XXXXXXXX";
 
     nvs_handle wifi_flash = flash_open("wifisetup");
     if (wifi_flash == -1) return NULL;
 
-    ni.ssid = flash_read_str(wifi_flash, "ssid",default_ssid, 20);
+    ni.ssid = flash_read_str(wifi_flash, "ssid", default_ssid, 20);
     if (!strcmp(ni.ssid, default_ssid))
         return NULL;
 
-    ni.password    = flash_read_str(wifi_flash, "password","pass", 20);
-    ni.mqtt_server = flash_read_str(wifi_flash, "mqtt_server","test.mosquitto.org", 20);
-    ni.mqtt_port   = flash_read_str(wifi_flash, "mqtt_port","1883", 6);
-    ni.mqtt_prefix = flash_read_str(wifi_flash, "mqtt_prefix","home/esp", 20);
+    ni.password    = flash_read_str(wifi_flash, "password",(char *)"pass", 20);
+    ni.mqtt_server = flash_read_str(wifi_flash, "mqtt_server",(char *) "test.mosquitto.org", 20);
+    ni.mqtt_port   = flash_read_str(wifi_flash, "mqtt_port",(char *) "1883", 6);
+    ni.mqtt_prefix = flash_read_str(wifi_flash, "mqtt_prefix",(char *) "home/esp", 20);
     return &ni;
 }
 
@@ -747,6 +749,8 @@ extern "C" void app_main(void)
     else
     {
         setup_flash = flash_open("storage");
+        clients_init(setup_flash, comminfo->mqtt_prefix, appname, chipid);
+
         gpio_install_isr_service(ESP_INTR_FLAG_DEFAULT);
         factoryreset_init();
 
@@ -821,7 +825,14 @@ extern "C" void app_main(void)
                     case LORA:
                         display_connections();
                         display_received(&meas);
-                        if (isConnected) sendtowifi(&meas, client, chipid);
+                        if (isConnected)
+                        {
+                            if (clients_isTableChanged())
+                            {
+                                clients_publish_devices(client, chipid);
+                            }
+                            sendtowifi(&meas, client, chipid);
+                        }
                     break;
 
                     case CLEARDISP:
